@@ -14,15 +14,27 @@ import (
 	"url-shortener/internal/service"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	envErr := godotenv.Load()
+	if envErr != nil {
+		slog.Error("something wrong with .env file")
+		os.Exit(1)
+	}
+
 	baseURL := os.Getenv("BASE_URL")
 	databaseURL := os.Getenv("DATABASE_URL")
 	appPort := os.Getenv("APP_PORT")
 
-	if baseURL == "" || databaseURL == "" || appPort == "" {
-		slog.Error("Something wrong with base_url or database_url or app port")
+	if databaseURL == "" {
+		slog.Error("something wrong with database_url")
+		os.Exit(1)
+	}
+
+	if baseURL == "" || appPort == "" {
+		slog.Error("Something wrong with base_url or app port")
 		os.Exit(1)
 	}
 
