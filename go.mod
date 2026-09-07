@@ -2,7 +2,10 @@ module url-shortener
 
 go 1.27.0
 
-require github.com/jackc/pgx/v5 v5.10.0
+require (
+	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jxskiss/base62 v1.1.0
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
