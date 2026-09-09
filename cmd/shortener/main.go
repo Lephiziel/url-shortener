@@ -15,13 +15,13 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
 	envErr := godotenv.Load()
 	if envErr != nil {
-		slog.Error("something wrong with .env file")
-		os.Exit(1)
+		slog.Warn("something wrong with .env file")
 	}
 
 	baseURL := os.Getenv("BASE_URL")
@@ -47,7 +47,17 @@ func main() {
 	defer pool.Close()
 
 	// Repository
-	repo := repository.NewRepository(pool)
+	pgRepo := repository.NewRepository(pool)
+
+	// Redis
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		slog.Error("Something wrong with redis address")
+		os.Exit(1)
+	}
+	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
+
+	repo := repository.NewCachedRepository(pgRepo, redisClient, 24*time.Hour)
 
 	// Service
 	svc := service.NewService(repo)
@@ -60,6 +70,7 @@ func main() {
 	mux.HandleFunc("POST /shorten", h.CreateLink)
 	mux.HandleFunc("GET /{code}", h.RedirectLink)
 
+	// Grateful shutdown pattern
 	srv := &http.Server{
 		Addr:    ":" + appPort,
 		Handler: mux,
