@@ -1,170 +1,203 @@
 # URL Shortener
 
-Сервис сокращения ссылок на Go, использующий только стандартный `net/http` для веб-слоя, PostgreSQL для хранения и Redis для кэширования.
+[Русская версия](README.ru.md)
 
-## Возможности
+A URL shortening service written in Go, using the standard `net/http` package for the web layer, PostgreSQL for persistent storage, and Redis for caching.
 
-- Сокращение длинной ссылки до компактного кода
-- Редирект по короткому коду на оригинальный URL
-- Redis cache-aside слой перед Postgres для нагрузки на чтение (редиректы)
-- Graceful shutdown (обработка SIGINT/SIGTERM, текущие запросы доотрабатывают перед остановкой)
-- Полная контейнеризация: одна команда поднимает приложение, Postgres, Redis и прогоняет миграции
+## Features
 
-## Архитектура
+- Shorten long URLs into compact codes
+- Redirect short codes to their original URLs
+- Redis cache-aside layer in front of PostgreSQL for read-heavy redirect traffic
+- Graceful shutdown with SIGINT/SIGTERM handling
+- Fully containerized setup: one command starts the application, PostgreSQL, Redis, and runs database migrations
 
-Проект построен по слоям с dependency injection через конструкторы, всё собирается в `main.go`:
+## Architecture
 
-```
-domain/       — базовые типы и sentinel-ошибки (Link, ErrNotFound, ErrInvalidURL)
-repository/   — хранение данных: интерфейс Repository, PostgresRepository, CachedRepository
-service/      — бизнес-логика: валидация URL, base62-кодирование, оркестрация
-handler/      — HTTP-слой: обработка запросов/ответов, статус-коды
-```
+The project follows a layered architecture with constructor-based dependency injection. All dependencies are wired together in `main.go`:
 
-Каждый слой зависит только от интерфейса нижележащего слоя, а не от конкретной реализации:
-
-```
-handler → service.Service (интерфейс)
-service → repository.Repository (интерфейс)
-repository.CachedRepository оборачивает repository.Repository (PostgresRepository) + Redis-клиент
+```text
+domain/       — core types and sentinel errors (Link, ErrNotFound, ErrInvalidURL)
+repository/   — data access: Repository interface, PostgresRepository, CachedRepository
+service/      — business logic: URL validation, base62 encoding, orchestration
+handler/      — HTTP layer: request/response handling and status codes
 ```
 
-Это значит, что `service` не знает и не должен знать, работает ли он с обычным Postgres-репозиторием или с версией, обёрнутой в Redis-кэш — это решение принимается один раз, в `main.go`.
+Each layer depends on an interface provided by the layer below it rather than on a concrete implementation:
 
-### Генерация коротких кодов
+```text
+handler → service.Service
+service → repository.Repository
+repository.CachedRepository → repository.Repository (PostgresRepository) + Redis client
+```
 
-Короткие коды генерируются из автоинкрементного ID, получаемого из отдельной Postgres `SEQUENCE` (через `NextID`), и кодируются в base62 с помощью небольшого написанного вручную энкодера (без сторонних зависимостей и без лишних аллокаций на горячем пути). ID запрашивается из sequence **до** вставки записи — так логика кодирования остаётся в `service`, а не в `repository`, сохраняя разделение между хранением данных и бизнес-логикой.
+As a result, the `service` layer does not need to know whether it is backed directly by PostgreSQL or by a Redis-cached repository. That decision is made once during dependency wiring in `main.go`.
 
-### Кэширование
+### Short Code Generation
 
-`GET /{code}` (эндпоинт редиректа) — самый частый путь в URL-шортенере, поэтому поиск ссылки идёт через паттерн cache-aside:
+Short codes are generated from auto-incrementing IDs obtained from a dedicated PostgreSQL `SEQUENCE` through `NextID`.
 
-1. Проверяем код в Redis
-2. При промахе кэша (или любой ошибке Redis) — идём в Postgres
-3. Записываем результат обратно в Redis с TTL
+The ID is encoded using a small custom base62 encoder without external dependencies or unnecessary allocations on the hot path.
 
-Redis рассматривается как оптимизация, а не как обязательная зависимость: если Redis недоступен или возвращает ошибку, сервис всё равно корректно работает через Postgres — кэш никогда не становится единой точкой отказа.
+The sequence ID is requested **before** inserting the record. This keeps encoding logic inside the `service` layer rather than the `repository` layer and preserves the separation between persistence and business logic.
 
-### Осознанные компромиссы
+### Caching
 
-- **Дубликаты URL разрешены.** Сокращение одного и того же длинного URL дважды создаёт два разных коротких кода. Это осознанное решение: дедупликация по URL лишила бы возможности отслеживать переходы на один и тот же адрес отдельно для разных кампаний/каналов — реальный сценарий использования у таких сервисов, как Bitly. Идемпотентность (в HTTP-смысле) осталась за скобками — это другая задача (механизм вроде `Idempotency-Key`), не совпадающая с дедупликацией по URL.
-- **Для редиректа используется 302 (Found), а не 301 (Moved Permanently).** 301 позволил бы браузерам кэшировать редирект навсегда, что сломало бы аналитику и не позволило бы в будущем обновлять или удалять ссылки.
+`GET /{code}` is expected to be the most frequently used endpoint in a URL shortener, so URL lookup uses the cache-aside pattern:
 
-## Стек технологий
+1. Look up the code in Redis
+2. On a cache miss or Redis error, query PostgreSQL
+3. Store the result back in Redis with a TTL
 
-| Область          | Выбор                              |
-|-------------------|-------------------------------------|
-| HTTP               | `net/http` (Go 1.27 `ServeMux`, паттерны метод + путь) |
-| База данных        | PostgreSQL, через `pgx`/`pgxpool`  |
-| Кэш                | Redis, через `redis/go-redis/v9`  |
-| Миграции           | `golang-migrate`                    |
-| Логирование        | `log/slog`                          |
-| Конфигурация       | Переменные окружения (`godotenv` для локальной загрузки `.env`) |
-| Контейнеризация    | Docker, multi-stage build + `docker-compose` |
-| Тестирование       | `testing` + `net/http/httptest`, написанные вручную моки |
+Redis is treated as an optimization rather than a required dependency.
 
-## Быстрый старт
+If Redis is unavailable or returns an error, the service continues to operate correctly using PostgreSQL. The cache therefore never becomes a single point of failure.
 
-### Требования
+### Design Trade-offs
 
-- Docker и Docker Compose
+- **Duplicate URLs are allowed.** Shortening the same URL multiple times creates different short codes. This makes it possible to track the same destination independently across different campaigns or channels. HTTP idempotency is a separate concern and could be implemented later using a mechanism such as `Idempotency-Key`.
 
-### Запуск через Docker Compose
+- **Redirects use `302 Found` instead of `301 Moved Permanently`.** A permanent redirect may be cached indefinitely by browsers, which would interfere with future analytics and make changing or deleting links harder.
+
+## Tech Stack
+
+| Area | Technology |
+|---|---|
+| HTTP | `net/http` (Go 1.27 `ServeMux`, method + path patterns) |
+| Database | PostgreSQL via `pgx` / `pgxpool` |
+| Cache | Redis via `redis/go-redis/v9` |
+| Migrations | `golang-migrate` |
+| Logging | `log/slog` |
+| Configuration | Environment variables (`godotenv` for local `.env` loading) |
+| Containers | Docker, multi-stage build, Docker Compose |
+| Testing | `testing`, `net/http/httptest`, handwritten mocks |
+
+## Quick Start
+
+### Requirements
+
+- Docker
+- Docker Compose
+
+### Run with Docker Compose
 
 ```bash
 cp .env.example .env
 docker-compose up --build
 ```
 
-Поднимается по порядку: Postgres → миграции (через одноразовый сервис `migrate`) → Redis → само приложение. API доступен на `http://localhost:8080`.
+The services are started in the following order:
 
-### Локальный запуск (без Docker)
+```text
+PostgreSQL → migrations → Redis → application
+```
 
-Требуется локально установленные PostgreSQL и Redis.
+The API will be available at:
+
+```text
+http://localhost:8080
+```
+
+### Run Locally
+
+This requires PostgreSQL and Redis to be installed locally.
 
 ```bash
 cp .env.example .env
-# отредактируй .env под свои локальные DATABASE_URL / REDIS_ADDR
+
+# Adjust DATABASE_URL and REDIS_ADDR in .env for your local environment
 
 migrate -path migrations -database "$DATABASE_URL" up
 go run ./cmd/shortener
 ```
 
-### Переменные окружения
+### Environment Variables
 
-| Переменная      | Описание                                     | Пример                                                           |
-|------------------|-----------------------------------------------|-------------------------------------------------------------------|
-| `DATABASE_URL`   | Строка подключения к Postgres                 | `postgres://postgres:postgres@localhost:5432/url-shortener?sslmode=disable` |
-| `BASE_URL`       | Базовый URL для формирования полной короткой ссылки | `http://localhost:8080/`                                     |
-| `APP_PORT`       | Порт, который слушает HTTP-сервер             | `8080`                                                             |
-| `REDIS_ADDR`     | Адрес Redis                                    | `localhost:6379`                                                   |
+| Variable | Description | Example |
+|---|---|---|
+| `DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@localhost:5432/url-shortener?sslmode=disable` |
+| `BASE_URL` | Base URL used to construct shortened URLs | `http://localhost:8080/` |
+| `APP_PORT` | HTTP server port | `8080` |
+| `REDIS_ADDR` | Redis address | `localhost:6379` |
 
 ## API
 
-### Создать короткую ссылку
+### Create a Short URL
 
-```
+```http
 POST /shorten
 Content-Type: application/json
+```
 
+```json
 {
   "url": "https://example.com/some/very/long/path"
 }
 ```
 
-**Ответ — `201 Created`**
+**Response — `201 Created`**
+
 ```json
 {
   "short_url": "http://localhost:8080/1"
 }
 ```
 
-**Ошибки**
-- `400 Bad Request` — некорректный JSON в теле запроса, либо невалидный/отсутствующий URL
-- `500 Internal Server Error` — неожиданная ошибка на сервере
+**Errors**
 
-### Редирект на оригинальный URL
+- `400 Bad Request` — malformed JSON or missing/invalid URL
+- `500 Internal Server Error` — unexpected server error
 
-```
+### Redirect to the Original URL
+
+```http
 GET /{code}
 ```
 
-Отвечает `302 Found` и заголовком `Location`, указывающим на оригинальный URL.
+Returns `302 Found` with a `Location` header pointing to the original URL.
 
-**Ошибки**
-- `400 Bad Request` — отсутствует код
-- `404 Not Found` — ссылка с таким кодом не найдена
-- `500 Internal Server Error` — неожиданная ошибка на сервере
+**Errors**
 
-## Тестирование
+- `400 Bad Request` — missing code
+- `404 Not Found` — no URL exists for the supplied code
+- `500 Internal Server Error` — unexpected server error
+
+## Testing
 
 ```bash
 go test ./... -v
 ```
 
-Покрытие:
-- `service` — юнит-тесты с написанным вручную `mockRepository`, покрывают успешное создание/поиск, валидацию URL и проброс ошибок репозитория
-- `handler` — юнит-тесты с написанным вручную `mockService` и `net/http/httptest`, покрывают все ветки статус-кодов для обоих эндпоинтов
+Test coverage includes:
 
-## Структура проекта
+- `service` — unit tests using a handwritten `mockRepository`, covering successful URL creation and lookup, URL validation, and repository error propagation
+- `handler` — unit tests using a handwritten `mockService` and `net/http/httptest`, covering HTTP status branches for both endpoints
 
-```
+## Project Structure
+
+```text
 .
 ├── cmd/
 │   └── shortener/
-│       └── main.go          # сборка зависимостей, запуск сервера, graceful shutdown
+│       └── main.go          # dependency wiring, server startup, graceful shutdown
 ├── internal/
-│   ├── domain/               # структура Link, sentinel-ошибки
-│   ├── repository/           # интерфейс Repository, реализации Postgres и Redis-кэша
-│   ├── service/               # бизнес-логика (валидация, base62-кодирование)
-│   └── handler/               # HTTP-хендлеры
-├── migrations/                 # SQL-файлы для golang-migrate
+│   ├── domain/              # Link type and sentinel errors
+│   ├── repository/          # Repository interface, PostgreSQL and Redis cache implementations
+│   ├── service/             # business logic, validation, base62 encoding
+│   └── handler/             # HTTP handlers
+├── migrations/              # SQL migrations for golang-migrate
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
 └── go.mod
 ```
 
-## Возможные доработки
+## Possible Improvements
 
-Не реализовано, но напрашивается как продолжение: кастомные алиасы, истечение срока действия ссылок (TTL у самих ссылок, а не только у кэша), rate limiting, аналитика кликов, gRPC API рядом с REST.
+Potential future additions include:
+
+- Custom aliases
+- Link expiration
+- Rate limiting
+- Click analytics
+- gRPC API alongside the REST API
