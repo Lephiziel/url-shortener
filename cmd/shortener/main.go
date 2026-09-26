@@ -4,18 +4,22 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+	"url-shortener/internal/grpcserver"
 	"url-shortener/internal/handler"
 	"url-shortener/internal/repository"
 	"url-shortener/internal/service"
+	shortenerpb "url-shortener/proto"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -27,13 +31,14 @@ func main() {
 	baseURL := os.Getenv("BASE_URL")
 	databaseURL := os.Getenv("DATABASE_URL")
 	appPort := os.Getenv("APP_PORT")
+	grpcPort := os.Getenv("GRPC_PORT")
 
 	if databaseURL == "" {
 		slog.Error("something wrong with database_url")
 		os.Exit(1)
 	}
 
-	if baseURL == "" || appPort == "" {
+	if baseURL == "" || appPort == "" || grpcPort == "" {
 		slog.Error("Something wrong with base_url or app port")
 		os.Exit(1)
 	}
@@ -65,6 +70,20 @@ func main() {
 	// Handler
 	h := handler.NewHandler(svc, baseURL)
 
+	// gRPC
+	grpcHandler := grpcserver.NewServer(svc, baseURL)
+
+	listener, listenerErr := net.Listen("tcp", ":"+grpcPort)
+	if listenerErr != nil {
+		slog.Error("failed to start listener", "error", listenerErr)
+		os.Exit(1)
+	}
+	defer listener.Close()
+
+	grpcSrv := grpc.NewServer()
+
+	shortenerpb.RegisterShortenerServiceServer(grpcSrv, grpcHandler)
+
 	// Routing
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /shorten", h.CreateLink)
@@ -76,6 +95,15 @@ func main() {
 		Handler: mux,
 	}
 
+	// gRPC Listen
+	go func() {
+		if err := grpcSrv.Serve(listener); err != nil {
+			slog.Error("gRPC server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// HTTP Listen
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server failed", "error", err)
