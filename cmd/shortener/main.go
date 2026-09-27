@@ -23,16 +23,19 @@ import (
 )
 
 func main() {
+	// Load .env file
 	envErr := godotenv.Load()
 	if envErr != nil {
 		slog.Warn("something wrong with .env file")
 	}
 
+	// Load variables from .env file
 	baseURL := os.Getenv("BASE_URL")
 	databaseURL := os.Getenv("DATABASE_URL")
 	appPort := os.Getenv("APP_PORT")
 	grpcPort := os.Getenv("GRPC_PORT")
 
+	// Checking values in variables
 	if databaseURL == "" {
 		slog.Error("something wrong with database_url")
 		os.Exit(1)
@@ -78,7 +81,6 @@ func main() {
 		slog.Error("failed to start listener", "error", listenerErr)
 		os.Exit(1)
 	}
-	defer listener.Close()
 
 	grpcSrv := grpc.NewServer()
 
@@ -89,7 +91,7 @@ func main() {
 	mux.HandleFunc("POST /shorten", h.CreateLink)
 	mux.HandleFunc("GET /{code}", h.RedirectLink)
 
-	// Grateful shutdown pattern
+	// Graceful shutdown
 	srv := &http.Server{
 		Addr:    ":" + appPort,
 		Handler: mux,
@@ -118,11 +120,26 @@ func main() {
 
 	<-ctx.Done()
 
+	grpcStopped := make(chan struct{})
+
+	go func() {
+		defer close(grpcStopped)
+		grpcSrv.GracefulStop()
+	}()
+
+	// HTTP Shutdown context
 	// If we get a signal we're going to stop the server with timeout correctly
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("graceful shutdown failed", "error", err)
+		slog.Error("HTTP graceful shutdown failed", "error", err)
+	}
+
+	select {
+	case <-grpcStopped:
+	case <-shutdownCtx.Done():
+		slog.Warn("gRPC graceful shutdown timed out, forcing stop")
+		grpcSrv.Stop()
 	}
 }
