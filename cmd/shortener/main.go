@@ -42,7 +42,7 @@ func main() {
 	}
 
 	if baseURL == "" || appPort == "" || grpcPort == "" {
-		slog.Error("Something wrong with base_url or app port")
+		slog.Error("Something wrong with base_url or app port or gRPC port")
 		os.Exit(1)
 	}
 
