@@ -11,11 +11,18 @@ import (
 
 type mockPublisher struct {
 	publishedEvent         event.LinkVisitedEvent
+	called                 bool
 	publishLinkVisitedFunc func(ctx context.Context, event event.LinkVisitedEvent) error
 }
 
 func (m *mockPublisher) PublishLinkVisited(ctx context.Context, e event.LinkVisitedEvent) error {
+	m.called = true
 	m.publishedEvent = e
+
+	if m.publishLinkVisitedFunc != nil {
+		return m.publishLinkVisitedFunc(ctx, e)
+	}
+
 	return nil
 }
 
@@ -115,6 +122,9 @@ func TestGetOriginalLink_Success(t *testing.T) {
 		t.Errorf("expected url: 'https://example.com', but we got %q", result.URL)
 	}
 
+	if !publisher.called {
+		t.Fatal("expected event to be published")
+	}
 	if publisher.publishedEvent.Code != link.Code {
 		t.Errorf("expected code %s, but got %s", link.Code, publisher.publishedEvent.Code)
 	}
@@ -122,7 +132,7 @@ func TestGetOriginalLink_Success(t *testing.T) {
 		t.Errorf("expected url: %q, but we got: %q", link.URL, publisher.publishedEvent.URL)
 	}
 	if publisher.publishedEvent.OccurredAt.IsZero() {
-		t.Errorf("expected zero occurade at, but we got %v", publisher.publishedEvent.OccurredAt)
+		t.Errorf("expected OccurredAt to be set, but we got %v", publisher.publishedEvent.OccurredAt)
 	}
 }
 
