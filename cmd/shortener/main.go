@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"url-shortener/internal/event"
 	"url-shortener/internal/grpcserver"
 	"url-shortener/internal/handler"
 	"url-shortener/internal/repository"
@@ -54,7 +55,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	// Repository
+	// Postgres Repository
 	pgRepo := repository.NewRepository(pool)
 
 	// Redis
@@ -65,10 +66,14 @@ func main() {
 	}
 	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
 
+	// Repository
 	repo := repository.NewCachedRepository(pgRepo, redisClient, 24*time.Hour)
 
+	// Publisher
+	publisher := event.NoopPublisher{}
+
 	// Service
-	svc := service.NewService(repo)
+	svc := service.NewService(repo, &publisher)
 
 	// Handler
 	h := handler.NewHandler(svc, baseURL)

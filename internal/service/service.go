@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"log/slog"
 	"net/url"
 	"time"
 	"url-shortener/internal/domain"
+	"url-shortener/internal/event"
 	"url-shortener/internal/repository"
 )
 
@@ -14,12 +16,14 @@ type Service interface {
 }
 
 type LinkService struct {
-	repo repository.Repository
+	repo      repository.Repository
+	publisher event.Publisher
 }
 
-func NewService(repo repository.Repository) *LinkService {
+func NewService(repo repository.Repository, publisher event.Publisher) *LinkService {
 	return &LinkService{
-		repo: repo,
+		repo:      repo,
+		publisher: publisher,
 	}
 }
 
@@ -78,6 +82,17 @@ func (ls *LinkService) GetOriginalLink(ctx context.Context, code string) (domain
 	res, err := ls.repo.FindLink(ctx, code)
 	if err != nil {
 		return domain.Link{}, err
+	}
+
+	visitedEvent := event.LinkVisitedEvent{
+		Code:       res.Code,
+		URL:        res.URL,
+		OccurredAt: time.Now().UTC(),
+	}
+
+	publishErr := ls.publisher.PublishLinkVisited(ctx, visitedEvent)
+	if publishErr != nil {
+		slog.Error("something went wrong with kafka", "error", publishErr)
 	}
 
 	return res, nil
