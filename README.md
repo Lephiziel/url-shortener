@@ -2,75 +2,122 @@
 
 [Русская версия](README.ru.md)
 
-A URL shortening service written in Go, using the standard `net/http` package for the web layer, PostgreSQL for persistent storage, and Redis for caching.
+A URL shortening service written in Go with HTTP and gRPC APIs, PostgreSQL for persistent storage, Redis for caching, and Kafka for link-visit events.
 
 ## Features
 
-- Shorten long URLs into compact codes
-- Redirect short codes to their original URLs
-- Redis cache-aside layer in front of PostgreSQL for read-heavy redirect traffic
-- Graceful shutdown with SIGINT/SIGTERM handling
-- Fully containerized setup: one command starts the application, PostgreSQL, Redis, and runs database migrations
+- Shorten long URLs into compact base62 codes
+- Resolve short codes through both HTTP and gRPC
+- HTTP redirects with `302 Found`
+- Redis cache-aside layer in front of PostgreSQL for read-heavy lookup traffic
+- gRPC API generated from Protocol Buffers
+- Kafka producer for `LinkVisitedEvent` analytics events
+- Analytics publishing is best-effort: Kafka failures do not break URL resolution or redirects
+- Graceful shutdown for HTTP and gRPC on SIGINT/SIGTERM
+- Fully containerized setup with PostgreSQL, Redis, Kafka, migrations, and the application
+- Unit tests for the service, HTTP transport, and gRPC transport using handwritten mocks
 
 ## Architecture
 
-The project follows a layered architecture with constructor-based dependency injection. All dependencies are wired together in `main.go`:
+The project follows a layered architecture with constructor-based dependency injection. Dependencies are wired in `cmd/shortener/main.go`.
 
 ```text
-domain/       — core types and sentinel errors (Link, ErrNotFound, ErrInvalidURL)
-repository/   — data access: Repository interface, PostgresRepository, CachedRepository
-service/      — business logic: URL validation, base62 encoding, orchestration
-handler/      — HTTP layer: request/response handling and status codes
+domain/       — core types and sentinel errors
+event/        — analytics event model and Publisher abstraction
+repository/   — PostgreSQL persistence and Redis cache-aside wrapper
+service/      — business logic, URL validation, base62 encoding, event publishing
+a handler/     — HTTP transport
+grpcserver/   — gRPC transport
+kafka/        — Kafka implementation of event.Publisher
+proto/        — Protocol Buffers contract and generated Go/gRPC code
 ```
 
-Each layer depends on an interface provided by the layer below it rather than on a concrete implementation:
+The main dependency flow is:
 
 ```text
-handler → service.Service
-service → repository.Repository
-repository.CachedRepository → repository.Repository (PostgresRepository) + Redis client
+HTTP handler ─┐
+              ├→ service.Service → repository.Repository
+ gRPC server ─┘          │
+                         └→ event.Publisher → KafkaPublisher → Kafka
+
+CachedRepository → PostgresRepository + Redis
 ```
 
-As a result, the `service` layer does not need to know whether it is backed directly by PostgreSQL or by a Redis-cached repository. That decision is made once during dependency wiring in `main.go`.
+The service layer depends on interfaces rather than concrete infrastructure. This keeps HTTP/gRPC transport, persistence, caching, and event delivery replaceable and independently testable.
 
 ### Short Code Generation
 
-Short codes are generated from auto-incrementing IDs obtained from a dedicated PostgreSQL `SEQUENCE` through `NextID`.
+Short codes are generated from IDs obtained from a dedicated PostgreSQL `SEQUENCE` through `NextID`.
 
-The ID is encoded using a small custom base62 encoder without external dependencies or unnecessary allocations on the hot path.
-
-The sequence ID is requested **before** inserting the record. This keeps encoding logic inside the `service` layer rather than the `repository` layer and preserves the separation between persistence and business logic.
+The ID is encoded with a small custom base62 encoder. The sequence ID is requested before inserting the record so code-generation logic remains in the service layer instead of the repository layer.
 
 ### Caching
 
-`GET /{code}` is expected to be the most frequently used endpoint in a URL shortener, so URL lookup uses the cache-aside pattern:
+URL lookup uses the cache-aside pattern:
 
-1. Look up the code in Redis
+1. Look up the short code in Redis
 2. On a cache miss or Redis error, query PostgreSQL
 3. Store the result back in Redis with a TTL
 
-Redis is treated as an optimization rather than a required dependency.
+Redis is an optimization rather than the source of truth. If Redis is unavailable, lookups can still fall back to PostgreSQL.
 
-If Redis is unavailable or returns an error, the service continues to operate correctly using PostgreSQL. The cache therefore never becomes a single point of failure.
+### gRPC
+
+The gRPC contract is defined in `proto/shortener.proto` and exposes two unary RPCs:
+
+```text
+CreateLink(CreateLinkRequest) → CreateLinkReply
+GetLink(GetLinkRequest)       → GetLinkReply
+```
+
+Both HTTP and gRPC transports use the same `service.Service` implementation, so validation and business rules are shared rather than duplicated.
+
+Domain errors are translated into gRPC status codes in the transport layer, for example:
+
+- invalid URL → `InvalidArgument`
+- unknown short code → `NotFound`
+- unexpected infrastructure error → `Internal`
+
+### Kafka Events
+
+After a short code is resolved successfully, the service creates a `LinkVisitedEvent` containing:
+
+```json
+{
+  "code": "4",
+  "url": "https://example.com",
+  "occurred_at": "2026-09-29T11:34:07.13781655Z"
+}
+```
+
+The event is published to the `link-visited` Kafka topic through the `event.Publisher` abstraction. The current implementation uses `franz-go`.
+
+Publishing is intentionally best-effort: if Kafka is unavailable, the error is logged but the original URL is still returned. Analytics must not become a dependency that can break redirects.
+
+The Kafka broker runs in KRaft mode in Docker Compose, without ZooKeeper.
 
 ### Design Trade-offs
 
-- **Duplicate URLs are allowed.** Shortening the same URL multiple times creates different short codes. This makes it possible to track the same destination independently across different campaigns or channels. HTTP idempotency is a separate concern and could be implemented later using a mechanism such as `Idempotency-Key`.
-
-- **Redirects use `302 Found` instead of `301 Moved Permanently`.** A permanent redirect may be cached indefinitely by browsers, which would interfere with future analytics and make changing or deleting links harder.
+- **Duplicate URLs are allowed.** Shortening the same URL multiple times creates different short codes. This makes it possible to track the same destination independently across campaigns or channels.
+- **Redirects use `302 Found` instead of `301 Moved Permanently`.** Permanent redirects may be cached aggressively by clients, which would interfere with analytics and future link changes.
+- **Kafka event delivery is currently best-effort.** This keeps the redirect path available when analytics infrastructure is down. Stronger delivery guarantees can be added later with patterns such as an outbox.
 
 ## Tech Stack
 
 | Area | Technology |
 |---|---|
-| HTTP | `net/http` (Go 1.27 `ServeMux`, method + path patterns) |
+| HTTP | Go `net/http` |
+| gRPC | `google.golang.org/grpc` |
+| Serialization | Protocol Buffers for gRPC, JSON for Kafka events |
 | Database | PostgreSQL via `pgx` / `pgxpool` |
 | Cache | Redis via `redis/go-redis/v9` |
+| Messaging | Apache Kafka in KRaft mode |
+| Kafka client | `franz-go` |
 | Migrations | `golang-migrate` |
 | Logging | `log/slog` |
-| Configuration | Environment variables (`godotenv` for local `.env` loading) |
+| Configuration | Environment variables, `godotenv` for local `.env` loading |
 | Containers | Docker, multi-stage build, Docker Compose |
-| Testing | `testing`, `net/http/httptest`, handwritten mocks |
+| Testing | Go `testing`, `net/http/httptest`, handwritten mocks |
 
 ## Quick Start
 
@@ -79,34 +126,39 @@ If Redis is unavailable or returns an error, the service continues to operate co
 - Docker
 - Docker Compose
 
+`grpcurl` is useful for manually testing the gRPC API.
+
 ### Run with Docker Compose
 
 ```bash
 cp .env.example .env
-docker-compose up --build
+docker compose up --build
 ```
 
-The services are started in the following order:
+The stack includes:
 
 ```text
-PostgreSQL → migrations → Redis → application
+PostgreSQL
+Redis
+Kafka (KRaft)
+migration job
+URL Shortener application
 ```
 
-The API will be available at:
+The application exposes:
 
 ```text
-http://localhost:8080
+HTTP: http://localhost:8080
+gRPC: localhost:9090
+Kafka: localhost:9092
 ```
 
 ### Run Locally
 
-This requires PostgreSQL and Redis to be installed locally.
+For a full local setup outside Docker, provide PostgreSQL, Redis, and Kafka and configure `.env` accordingly.
 
 ```bash
 cp .env.example .env
-
-# Adjust DATABASE_URL and REDIS_ADDR in .env for your local environment
-
 migrate -path migrations -database "$DATABASE_URL" up
 go run ./cmd/shortener
 ```
@@ -118,9 +170,14 @@ go run ./cmd/shortener
 | `DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@localhost:5432/url-shortener?sslmode=disable` |
 | `BASE_URL` | Base URL used to construct shortened URLs | `http://localhost:8080/` |
 | `APP_PORT` | HTTP server port | `8080` |
+| `GRPC_PORT` | gRPC server port | `9090` |
 | `REDIS_ADDR` | Redis address | `localhost:6379` |
+| `KAFKA_BROKERS` | Comma-separated Kafka bootstrap brokers | `localhost:9092` |
+| `KAFKA_TOPIC` | Topic for link-visit events | `link-visited` |
 
-## API
+Inside Docker Compose the application uses Kafka's internal listener, for example `kafka:19092`, while host tools connect through `localhost:9092`.
+
+## HTTP API
 
 ### Create a Short URL
 
@@ -162,16 +219,69 @@ Returns `302 Found` with a `Location` header pointing to the original URL.
 - `404 Not Found` — no URL exists for the supplied code
 - `500 Internal Server Error` — unexpected server error
 
+## gRPC API
+
+### CreateLink
+
+```bash
+grpcurl \
+  -plaintext \
+  -proto proto/shortener.proto \
+  -d '{"url":"https://example.com"}' \
+  localhost:9090 \
+  shortener.ShortenerService/CreateLink
+```
+
+Example response:
+
+```json
+{
+  "shortUrl": "http://localhost:8080/4"
+}
+```
+
+### GetLink
+
+```bash
+grpcurl \
+  -plaintext \
+  -proto proto/shortener.proto \
+  -d '{"code":"4"}' \
+  localhost:9090 \
+  shortener.ShortenerService/GetLink
+```
+
+Example response:
+
+```json
+{
+  "originalUrl": "https://example.com"
+}
+```
+
+## Inspect Kafka Events
+
+After resolving a short link, events can be inspected from the Kafka container:
+
+```bash
+docker exec -it url-shortener-kafka-1 \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic link-visited \
+  --from-beginning
+```
+
 ## Testing
 
 ```bash
 go test ./... -v
 ```
 
-Test coverage includes:
+Current tests include:
 
-- `service` — unit tests using a handwritten `mockRepository`, covering successful URL creation and lookup, URL validation, and repository error propagation
-- `handler` — unit tests using a handwritten `mockService` and `net/http/httptest`, covering HTTP status branches for both endpoints
+- `service` — URL creation/lookup, validation, repository errors, link-visit event publishing, and publisher-failure behavior
+- `handler` — HTTP transport branches with `httptest` and a handwritten `mockService`
+- `grpcserver` — successful RPCs and gRPC status mapping for invalid input, missing links, and internal errors
 
 ## Project Structure
 
@@ -179,25 +289,33 @@ Test coverage includes:
 .
 ├── cmd/
 │   └── shortener/
-│       └── main.go          # dependency wiring, server startup, graceful shutdown
+│       └── main.go
 ├── internal/
-│   ├── domain/              # Link type and sentinel errors
-│   ├── repository/          # Repository interface, PostgreSQL and Redis cache implementations
-│   ├── service/             # business logic, validation, base62 encoding
-│   └── handler/             # HTTP handlers
-├── migrations/              # SQL migrations for golang-migrate
+│   ├── domain/
+│   ├── event/
+│   ├── grpcserver/
+│   ├── handler/
+│   ├── kafka/
+│   ├── repository/
+│   └── service/
+├── proto/
+│   ├── shortener.proto
+│   ├── shortener.pb.go
+│   └── shortener_grpc.pb.go
+├── migrations/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
 └── go.mod
 ```
 
-## Possible Improvements
+## Next Steps
 
-Potential future additions include:
+Planned improvements include:
 
+- Kafka consumer / analytics service
+- Persistent click statistics and analytics API
+- Stronger event-delivery guarantees, for example an outbox pattern
+- Rate limiting
 - Custom aliases
 - Link expiration
-- Rate limiting
-- Click analytics
-- gRPC API alongside the REST API
