@@ -6,9 +6,9 @@ import (
 )
 
 type LinkVisitedEvent struct {
-	Code       string
-	URL        string
-	OccurredAt time.Time
+	Code       string    `json:"code"`
+	URL        string    `json:"url"`
+	OccurredAt time.Time `json:"occurred_at"`
 }
 
 type Publisher interface {

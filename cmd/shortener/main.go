@@ -8,11 +8,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
-	"url-shortener/internal/event"
 	"url-shortener/internal/grpcserver"
 	"url-shortener/internal/handler"
+	kafkapublisher "url-shortener/internal/kafka"
 	"url-shortener/internal/repository"
 	"url-shortener/internal/service"
 	shortenerpb "url-shortener/proto"
@@ -35,6 +36,8 @@ func main() {
 	databaseURL := os.Getenv("DATABASE_URL")
 	appPort := os.Getenv("APP_PORT")
 	grpcPort := os.Getenv("GRPC_PORT")
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+	kafkaTopic := os.Getenv("KAFKA_TOPIC")
 
 	// Checking values in variables
 	if databaseURL == "" {
@@ -44,6 +47,11 @@ func main() {
 
 	if baseURL == "" || appPort == "" || grpcPort == "" {
 		slog.Error("Something wrong with base_url or app port or gRPC port")
+		os.Exit(1)
+	}
+
+	if kafkaBrokers == "" || kafkaTopic == "" {
+		slog.Error("something wrong with kafka variables")
 		os.Exit(1)
 	}
 
@@ -69,11 +77,17 @@ func main() {
 	// Repository
 	repo := repository.NewCachedRepository(pgRepo, redisClient, 24*time.Hour)
 
-	// Publisher
-	publisher := event.NoopPublisher{}
+	// Brokers and Publisher
+	brokers := strings.Split(kafkaBrokers, ",")
+	publisher, kafkaErr := kafkapublisher.NewPublisher(brokers, kafkaTopic)
+	if kafkaErr != nil {
+		slog.Error("something wrong with kafka publisher")
+		os.Exit(1)
+	}
+	defer publisher.Close()
 
 	// Service
-	svc := service.NewService(repo, &publisher)
+	svc := service.NewService(repo, publisher)
 
 	// Handler
 	h := handler.NewHandler(svc, baseURL)
