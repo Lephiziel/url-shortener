@@ -3,6 +3,8 @@ package analytics
 import (
 	"context"
 
+	"url-shortener/internal/event"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -16,7 +18,7 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	}
 }
 
-func (r *Repository) RecordVisit(ctx context.Context, visit Visit) error {
+func (r *Repository) RecordVisit(ctx context.Context, visit *event.Visit) error {
 	_, err := r.pool.Exec(
 		ctx,
 		`INSERT INTO link_visits (

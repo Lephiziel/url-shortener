@@ -46,7 +46,7 @@ services:
     ports:
       - "8080:8080"
       - "9090:9090"
-    stop_grace_period: 20s
+    stop_grace_period: 30s
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/url-shortener?sslmode=disable
       BASE_URL: http://localhost:8080/
@@ -99,6 +99,7 @@ services:
       context: .
       target: analytics
     environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/url-shortener?sslmode=disable
       KAFKA_BROKERS: kafka:19092
       KAFKA_TOPIC: link-visited
       KAFKA_GROUP_ID: url-shortener-analytics
