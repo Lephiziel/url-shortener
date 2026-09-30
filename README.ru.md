@@ -2,276 +2,257 @@
 
 [English version](README.md)
 
-Сервис сокращения ссылок на Go с HTTP- и gRPC-API, PostgreSQL для постоянного хранения, Redis для кэширования и Kafka для событий переходов по коротким ссылкам.
+Сервис сокращения ссылок на Go с HTTP- и gRPC-API, постоянным хранением в PostgreSQL, кэшем Redis и аналитикой переходов через Kafka. Отдельный Analytics Consumer сохраняет события переходов в PostgreSQL и защищает от повторного учёта одной и той же записи Kafka.
 
 ## Возможности
 
-- Сокращение длинных URL в компактные base62-коды
-- Получение оригинальной ссылки через HTTP и gRPC
-- HTTP-редиректы через `302 Found`
-- Redis cache-aside перед PostgreSQL для частых запросов на чтение
-- gRPC API, сгенерированный из Protocol Buffers
-- Kafka producer для аналитических событий `LinkVisitedEvent`
-- Best-effort публикация аналитики: недоступность Kafka не ломает получение ссылки и редиректы
-- Graceful shutdown HTTP и gRPC при SIGINT/SIGTERM
-- Полностью контейнеризированный стек: PostgreSQL, Redis, Kafka, миграции и приложение
-- Юнит-тесты service-, HTTP- и gRPC-слоёв с написанными вручную моками
+- Генерация коротких base62-кодов из ID, полученных из PostgreSQL sequence
+- HTTP API для создания ссылок и редиректов `302 Found`
+- gRPC API (`CreateLink` и `GetLink`) с общей бизнес-логикой
+- Постоянное хранение в PostgreSQL и Redis cache-aside с fallback на БД
+- Асинхронная best-effort публикация событий в Kafka без ожидания доставки при редиректе
+- Отдельный Analytics Consumer с ручным подтверждением offset после записи в БД
+- Защита от дубликатов по Kafka topic, partition и offset
+- Docker Compose с автоматическим созданием Kafka topic и применением миграций
+- Graceful shutdown HTTP/gRPC, попытка отправить накопленные Kafka-события перед остановкой и корректное закрытие Analytics Consumer
+- Юнит-тесты бизнес-логики, HTTP- и gRPC-слоёв
 
 ## Архитектура
 
-Проект построен по слоям с dependency injection через конструкторы. Зависимости собираются в `cmd/shortener/main.go`.
-
 ```text
-domain/       — базовые типы и sentinel-ошибки
-event/        — модель аналитических событий и абстракция Publisher
-repository/   — PostgreSQL и cache-aside обёртка с Redis
-service/      — бизнес-логика, валидация URL, base62, публикация событий
-handler/      — HTTP transport
-grpcserver/   — gRPC transport
-kafka/        — Kafka-реализация event.Publisher
-proto/        — protobuf-контракт и сгенерированный Go/gRPC-код
+                ┌────────────────────┐
+HTTP / gRPC ────►│  Shortener service │
+                └─────────┬──────────┘
+                          │
+             ┌────────────┴─────────────┐
+             │                          │
+             ▼                          ▼
+    Cached repository           Async Kafka producer
+       │       │                        │
+       ▼       ▼                        ▼
+     Redis  PostgreSQL            link-visited topic
+                                          │
+                                          ▼
+                                   Analytics consumer
+                                          │
+                                          ▼
+                                 PostgreSQL link_visits
 ```
 
-Основной поток зависимостей:
+Проект использует слоистую архитектуру и внедрение зависимостей через конструкторы. HTTP и gRPC вызывают одну реализацию сервиса, которая зависит от интерфейсов репозитория и издателя событий. Точки входа — `cmd/shortener/main.go` и `cmd/analytics/main.go`.
 
-```text
-HTTP handler ─┐
-              ├→ service.Service → repository.Repository
- gRPC server ─┘          │
-                         └→ event.Publisher → KafkaPublisher → Kafka
+### Создание и получение ссылок
 
-CachedRepository → PostgresRepository + Redis
-```
+Сервис получает ID из PostgreSQL sequence и кодирует его в base62. Повторное сокращение одного URL создаёт отдельный код.
 
-`service` зависит от интерфейсов, а не от конкретной инфраструктуры. Благодаря этому HTTP/gRPC transport, хранилище, кэш и доставка событий можно тестировать и заменять независимо друг от друга.
+При чтении Cached Repository сначала проверяет Redis. При cache miss или ошибке Redis используется PostgreSQL; полученное из БД значение сохраняется в Redis с TTL. Источник истины — PostgreSQL. HTTP использует `302`, а не постоянно кэшируемый `301`, чтобы последующие запросы продолжали поступать в сервис.
 
-### Генерация коротких кодов
+### Обработка событий переходов
 
-Короткие коды генерируются из ID, получаемых из отдельной PostgreSQL `SEQUENCE` через `NextID`. ID кодируется собственным base62-энкодером. Sequence ID запрашивается до вставки записи, поэтому логика генерации кода остаётся в `service`, а не переносится в `repository`.
-
-### Кэширование
-
-Поиск ссылки использует cache-aside:
-
-1. Ищем короткий код в Redis
-2. При cache miss или ошибке Redis обращаемся к PostgreSQL
-3. Кладём найденный результат обратно в Redis с TTL
-
-Redis используется как оптимизация, а не как source of truth. Если Redis недоступен, поиск может продолжить работу через PostgreSQL.
-
-### gRPC
-
-Контракт находится в `proto/shortener.proto` и содержит два unary RPC:
-
-```text
-CreateLink(CreateLinkRequest) → CreateLinkReply
-GetLink(GetLinkRequest)       → GetLinkReply
-```
-
-HTTP и gRPC используют одну и ту же реализацию `service.Service`, поэтому бизнес-правила и валидация не дублируются между transport-слоями.
-
-Domain-ошибки преобразуются в gRPC status codes на уровне transport:
-
-- невалидный URL → `InvalidArgument`
-- неизвестный короткий код → `NotFound`
-- неожиданная инфраструктурная ошибка → `Internal`
-
-### Kafka-события
-
-После успешного получения оригинальной ссылки service создаёт `LinkVisitedEvent`:
+После успешного получения оригинального URL сервис публикует `LinkVisitedEvent` в Kafka topic `link-visited`. Событие содержит короткий код, URL назначения и время:
 
 ```json
 {
   "code": "4",
   "url": "https://example.com",
-  "occurred_at": "2026-09-29T11:34:07.13781655Z"
+  "occurred_at": "2026-09-29T11:34:07Z"
 }
 ```
 
-Событие публикуется в Kafka topic `link-visited` через интерфейс `event.Publisher`. Текущая реализация producer использует `franz-go`.
+Producer реализован на `franz-go`: он асинхронно ставит сообщения в очередь, используя короткий код как Kafka record key. Ошибки доставки логируются. Доступность редиректа важнее аналитики; при штатном завершении приложение пытается отправить накопленные сообщения с ограничением по времени.
 
-Публикация сделана best-effort: если Kafka недоступна, ошибка логируется, но оригинальный URL всё равно возвращается. Аналитика не должна становиться зависимостью, способной сломать редиректы.
+Analytics работает отдельным процессом в Kafka consumer group (по умолчанию `url-shortener-analytics`). Для каждого сообщения Consumer сначала записывает переход в PostgreSQL и **только после успешной записи** подтверждает offset. В таблице `link_visits` действует уникальное ограничение `(kafka_topic, kafka_partition, kafka_offset)`, а вставка использует `ON CONFLICT DO NOTHING`. Поэтому повторное чтение **той же записи Kafka** не создаёт вторую запись о переходе.
 
-Kafka запускается в Docker Compose в KRaft-режиме, без ZooKeeper.
+Это не end-to-end exactly-once: публикация событий остаётся best-effort, а уникальное ограничение защищает от повторного чтения конкретного Kafka-сообщения, но не от двух отдельно опубликованных одинаковых событий.
 
-### Осознанные компромиссы
-
-- **Дубликаты URL разрешены.** Повторное сокращение одного URL создаёт новый короткий код. Это позволяет независимо отслеживать один destination для разных кампаний или каналов.
-- **Редиректы используют `302 Found`, а не `301 Moved Permanently`.** Постоянный редирект может агрессивно кэшироваться клиентом, что мешает аналитике и будущему изменению ссылки.
-- **Доставка Kafka-события сейчас best-effort.** Основной redirect path остаётся доступным даже при проблемах с аналитической инфраструктурой. Более сильные гарантии можно добавить позже, например через outbox pattern.
+Kafka запускается в KRaft-режиме без ZooKeeper. Одноразовый Compose-сервис `kafka-init` создаёт `link-visited`, если topic отсутствует; отдельный сервис применяет миграции PostgreSQL.
 
 ## Стек технологий
 
 | Область | Технология |
-|---|---|
-| HTTP | Go `net/http` |
-| gRPC | `google.golang.org/grpc` |
-| Сериализация | Protocol Buffers для gRPC, JSON для Kafka events |
-| База данных | PostgreSQL через `pgx` / `pgxpool` |
-| Кэш | Redis через `redis/go-redis/v9` |
-| Messaging | Apache Kafka в KRaft-режиме |
-| Kafka client | `franz-go` |
+| --- | --- |
+| Язык / HTTP | Go / `net/http` |
+| RPC | gRPC и Protocol Buffers |
+| База данных | PostgreSQL, `pgx` / `pgxpool` |
+| Кэш | Redis, `redis/go-redis/v9` |
+| Обмен событиями | Apache Kafka (KRaft), `franz-go` |
 | Миграции | `golang-migrate` |
-| Логирование | `log/slog` |
-| Конфигурация | Переменные окружения, `godotenv` для локального `.env` |
-| Контейнеризация | Docker, multi-stage build, Docker Compose |
-| Тестирование | Go `testing`, `net/http/httptest`, handwritten mocks |
+| Логи / конфигурация | `log/slog`, переменные окружения, `godotenv` для локального запуска |
+| Контейнеры / тесты | Docker Compose, Go `testing`, `httptest`, самописные моки |
 
-## Быстрый старт
+## Быстрый запуск
 
-### Требования
-
-- Docker
-- Docker Compose
-- `grpcurl` для ручного тестирования gRPC
-
-### Запуск через Docker Compose
+**Требования:** Docker и Docker Compose. Для ручной проверки gRPC дополнительно пригодится `grpcurl`.
 
 ```bash
-cp .env.example .env
-docker compose up --build
+docker compose up -d --build
+docker compose ps
 ```
 
-Поднимаются PostgreSQL, Redis, Kafka (KRaft), одноразовый сервис миграций и URL Shortener.
+Compose запускает PostgreSQL, Redis, Kafka, одноразовые сервисы создания topic и миграций, основное приложение и Analytics Consumer. Доступные с хоста адреса:
 
-```text
-HTTP: http://localhost:8080
-gRPC: localhost:9090
-Kafka: localhost:9092
-```
+| Сервис | Адрес |
+| --- | --- |
+| HTTP API | `http://localhost:8080` |
+| gRPC API | `localhost:9090` |
+| PostgreSQL | `localhost:5432` |
+| Redis | `localhost:6379` |
+| Kafka (внешний listener) | `localhost:9092` |
 
-### Локальный запуск
+Для запуска через Compose **не нужно** копировать `.env.example`: Compose напрямую задаёт переменные окружения контейнеров. Пароль БД и открытые порты в этой конфигурации предназначены **только для локальной разработки**. Не разворачивайте её в production без изменений.
 
-Для полного запуска вне Docker нужны PostgreSQL, Redis и Kafka с корректными значениями в `.env`.
+Остановить контейнеры, сохранив PostgreSQL volume:
 
 ```bash
+docker compose down
+```
+
+### Локальный запуск Go-процессов
+
+Сначала запустите инфраструктуру и миграции, затем настройте подключения к локальным портам:
+
+```bash
+docker compose up -d postgres redis kafka kafka-init migrate
 cp .env.example .env
-migrate -path migrations -database "$DATABASE_URL" up
+```
+
+Измените `.env`: для PostgreSQL из прилагаемого Compose используйте такие значения:
+
+```dotenv
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/url-shortener?sslmode=disable
+BASE_URL=http://localhost:8080/
+APP_PORT=8080
+GRPC_PORT=9090
+REDIS_ADDR=localhost:6379
+KAFKA_BROKERS=localhost:9092
+KAFKA_TOPIC=link-visited
+KAFKA_GROUP_ID=url-shortener-analytics
+```
+
+В двух отдельных терминалах:
+
+```bash
 go run ./cmd/shortener
 ```
 
-### Переменные окружения
+```bash
+go run ./cmd/analytics
+```
 
-| Переменная | Описание | Пример |
-|---|---|---|
-| `DATABASE_URL` | Строка подключения к PostgreSQL | `postgres://postgres:postgres@localhost:5432/url-shortener?sslmode=disable` |
-| `BASE_URL` | Базовый URL для формирования короткой ссылки | `http://localhost:8080/` |
-| `APP_PORT` | Порт HTTP-сервера | `8080` |
-| `GRPC_PORT` | Порт gRPC-сервера | `9090` |
-| `REDIS_ADDR` | Адрес Redis | `localhost:6379` |
-| `KAFKA_BROKERS` | Kafka bootstrap brokers через запятую | `localhost:9092` |
-| `KAFKA_TOPIC` | Topic для событий переходов | `link-visited` |
-
-В Docker Compose приложение подключается к внутреннему listener Kafka (`kafka:19092`), а инструменты на хосте — через `localhost:9092`.
+Не запускайте локально сервисы одновременно с их Compose-экземплярами, если они конфликтуют по портам или потребляют события одной consumer group.
 
 ## HTTP API
 
 ### Создать короткую ссылку
 
-```http
-POST /shorten
-Content-Type: application/json
+```bash
+curl -i -X POST http://localhost:8080/shorten \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com"}'
 ```
+
+Пример ответа (`201 Created`; код может отличаться):
 
 ```json
-{
-  "url": "https://example.com/some/very/long/path"
-}
+{"short_url":"http://localhost:8080/4"}
 ```
 
-**Ответ — `201 Created`**
+Неправильный JSON или невалидный URL приводят к `400`, неожиданная ошибка инфраструктуры — к `500`.
 
-```json
-{
-  "short_url": "http://localhost:8080/1"
-}
+### Перейти по ссылке
+
+```bash
+curl -i http://localhost:8080/4
 ```
 
-### Редирект на оригинальный URL
-
-```http
-GET /{code}
-```
-
-Возвращает `302 Found` с заголовком `Location`, указывающим на оригинальный URL.
+`GET /{code}` возвращает `302 Found` и заголовок `Location` с оригинальным URL. Для несуществующего кода возвращается `404`. Вместо `4` подставьте код, полученный из собственного запроса `POST /shorten`.
 
 ## gRPC API
 
-### CreateLink
+Контракт описан в [`proto/shortener.proto`](proto/shortener.proto). gRPC-сервер слушает `localhost:9090` и предоставляет два unary RPC:
+
+```text
+shortener.ShortenerService/CreateLink
+shortener.ShortenerService/GetLink
+```
 
 ```bash
-grpcurl \
-  -plaintext \
-  -proto proto/shortener.proto \
+grpcurl -plaintext -proto proto/shortener.proto \
   -d '{"url":"https://example.com"}' \
-  localhost:9090 \
-  shortener.ShortenerService/CreateLink
+  localhost:9090 shortener.ShortenerService/CreateLink
 ```
 
-### GetLink
-
 ```bash
-grpcurl \
-  -plaintext \
-  -proto proto/shortener.proto \
+grpcurl -plaintext -proto proto/shortener.proto \
   -d '{"code":"4"}' \
-  localhost:9090 \
-  shortener.ShortenerService/GetLink
+  localhost:9090 shortener.ShortenerService/GetLink
 ```
 
-## Просмотр Kafka-событий
+Замените `4` на реально созданный код. Ошибки валидации преобразуются в `InvalidArgument`, неизвестный код — в `NotFound`, другие ошибки — в `Internal`.
+
+## Проверка аналитики
+
+Сначала создайте ссылку и выполните переход. Посмотрите Kafka-события:
 
 ```bash
-docker exec -it url-shortener-kafka-1 \
+docker compose exec kafka \
   /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic link-visited \
-  --from-beginning
+  --bootstrap-server kafka:19092 \
+  --topic link-visited --from-beginning
 ```
+
+Остановите консольный Consumer через Ctrl+C. Проверьте сохранённые переходы:
+
+```bash
+docker compose exec postgres \
+  psql -U postgres -d url-shortener \
+  -c 'SELECT code, COUNT(*) FROM link_visits GROUP BY code ORDER BY code;'
+```
+
+Посмотрите прогресс Kafka Consumer Group:
+
+```bash
+docker compose exec kafka \
+  /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:19092 \
+  --group url-shortener-analytics --describe
+```
+
+Сейчас статистика **хранится только в PostgreSQL**; публичного endpoint `/stats/{code}` нет.
 
 ## Тестирование
 
 ```bash
-go test ./... -v
+go test ./...
 ```
 
-Сейчас тестами покрыты:
-
-- `service` — создание/поиск ссылок, валидация URL, ошибки repository, публикация `LinkVisitedEvent` и поведение при ошибке publisher
-- `handler` — HTTP transport через `httptest` и handwritten `mockService`
-- `grpcserver` — успешные RPC и mapping ошибок в `InvalidArgument`, `NotFound`, `Internal`
+Имеющиеся юнит-тесты проверяют бизнес-логику и публикацию событий (`internal/service`), HTTP handlers (`internal/handler`) и gRPC-методы / преобразование ошибок (`internal/grpcserver`). Kafka и запись аналитики в PostgreSQL дополнительно проверялись вручную через Compose; автоматических интеграционных тестов для этого сценария пока нет.
 
 ## Структура проекта
 
 ```text
 .
 ├── cmd/
-│   └── shortener/
-│       └── main.go
+│   ├── shortener/main.go         # HTTP + gRPC-приложение
+│   └── analytics/main.go         # Отдельный Kafka Consumer
 ├── internal/
-│   ├── domain/
-│   ├── event/
-│   ├── grpcserver/
-│   ├── handler/
-│   ├── kafka/
-│   ├── repository/
-│   └── service/
-├── proto/
-│   ├── shortener.proto
-│   ├── shortener.pb.go
-│   └── shortener_grpc.pb.go
-├── migrations/
+│   ├── analytics/               # Сохранение переходов
+│   ├── domain/                  # Доменные типы и ошибки
+│   ├── event/                   # Модели событий и интерфейс Publisher
+│   ├── grpcserver/              # gRPC transport
+│   ├── handler/                 # HTTP transport
+│   ├── kafka/                   # Kafka Producer и Consumer
+│   ├── repository/              # PostgreSQL + Redis cache-aside
+│   └── service/                 # Бизнес-логика / base62
+├── migrations/                 # Sequence, links и link_visits
+├── proto/                      # Protobuf и сгенерированный Go-код
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
-└── go.mod
+├── README.md
+└── README.ru.md
 ```
 
-## Следующие шаги
+## Границы проекта
 
-- Kafka consumer / отдельный analytics service
-- Постоянное хранение статистики переходов и analytics API
-- Более сильные гарантии доставки событий, например через outbox pattern
-- Rate limiting
-- Кастомные aliases
-- Expiration ссылок
+Это учебный backend-проект для портфолио, а не готовый публичный сервис. Текущая реализация отдаёт приоритет редиректам, а не гарантированной доставке событий. Здесь пока нет аккаунтов, авторизации, rate limiting, пользовательских alias, срока действия ссылок и публичного API статистики.
