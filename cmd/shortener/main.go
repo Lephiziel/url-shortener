@@ -153,6 +153,13 @@ func main() {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("HTTP graceful shutdown failed", "error", err)
+
+		if closeErr := srv.Close(); closeErr != nil {
+			slog.Error(
+				"HTTP forced shutdown failed",
+				"error", closeErr,
+			)
+		}
 	}
 
 	select {
@@ -160,5 +167,22 @@ func main() {
 	case <-shutdownCtx.Done():
 		slog.Warn("gRPC graceful shutdown timed out, forcing stop")
 		grpcSrv.Stop()
+	}
+
+	flushCtx, flushCancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer flushCancel()
+
+	slog.Info("flushing pending Kafka events")
+
+	if err := publisher.Flush(flushCtx); err != nil {
+		slog.Error(
+			"Kafka graceful shutdown failed",
+			"error", err,
+		)
+	} else {
+		slog.Info("Kafka event flushed successfully")
 	}
 }

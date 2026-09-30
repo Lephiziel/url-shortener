@@ -1,4 +1,4 @@
-package main
+package analytics
 
 import (
 	"log/slog"
@@ -51,6 +51,7 @@ func main() {
 	if runErr != nil {
 		slog.Error("failed running consumer", "error", runErr)
 	}
+
 	slog.Info(
 		"analytics consumer started",
 		"brokers", brokers,
